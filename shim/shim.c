@@ -503,37 +503,56 @@ static uint32_t to_us(uint64_t ticks)
 }
 
 /*
- * CPU clock (OSM) snapshot.
+ * CPU clock + speed probe.
  *
- * SM8150 exposes the CPU clock controller as qcom,clk-cpu-osm
- * (vendor DT: clock_cpucc), i.e. the *OSM* register layout, not EPSS --
- * so perf_state is at 0x920 and the frequency LUT at 0x110/0x118, while
- * 0x320/0x100 belong to the newer EPSS blocks and read back as zero here.
- *   osm_pwrcl_base   0x18323000  (4x A55)
- *   osm_perfcl_base  0x18325800  (3x A76 gold)
- *   osm_perfpcl_base 0x18327800  (1x A76 prime)
- * Read only: nothing is written, the values are printed for decoding.
+ * Registers (vendor DT: clock_cpucc / qcom,clk-cpu-osm, and the OSM variant
+ * in drivers/cpufreq/qcom-cpufreq-hw.c):
+ *   osm_pwrcl_base    0x18323000 (4x A55)   osm_perfcl_base  0x18325800
+ *   osm_perfpcl_base  0x18327800 (1x A76)   freq LUT 0x110, volt LUT 0x114
+ *   LUT stride 32 bytes, current vote 0x704 (low 10 bits), perf_state 0x920
+ * The register reads are informational; the loop below is the hard evidence,
+ * since it measures the core speed without trusting any decode.
  */
 static void cpuclk_dump(void)
 {
         for (unsigned i = 0; i < 3; i++) {
-                uintptr_t base = (i == 0) ? 0x18323000UL :
+                uintptr_t b = (i == 0) ? 0x18323000UL :
                     (i == 1) ? 0x18325800UL : 0x18327800UL;
-                uint32_t st = rd32(base + 0x920u);   /* current perf state */
-                uint32_t f0 = rd32(base + 0x110u);   /* LUT[0] freq/volt  */
-                uint32_t v0 = rd32(base + 0x114u);
-                uint32_t f1 = rd32(base + 0x118u);   /* LUT[1] freq       */
+                uint32_t vote = rd32(b + 0x704u) & 0x3ffu;
+                uint32_t f0 = rd32(b + 0x110u);
+                uint32_t v0 = rd32(b + 0x114u);
+                uint32_t f1 = rd32(b + 0x130u);   /* +32, the real entry 1 */
+                uint32_t v1 = rd32(b + 0x134u);
                 if (i == 0) {
-                        con_hex2("OSM0", "st=", st, "f0=", f0);
+                        con_hex2("OSM0", "vote=", vote, "f0=", f0);
                         con_hex2("    ", "v0=", v0, "f1=", f1);
+                        con_hex2("    ", "v1=", v1, "ps=", rd32(b + 0x920u));
                 } else if (i == 1) {
-                        con_hex2("OSM1", "st=", st, "f0=", f0);
+                        con_hex2("OSM1", "vote=", vote, "f0=", f0);
                         con_hex2("    ", "v0=", v0, "f1=", f1);
+                        con_hex2("    ", "v1=", v1, "ps=", rd32(b + 0x920u));
                 } else {
-                        con_hex2("OSM2", "st=", st, "f0=", f0);
+                        con_hex2("OSM2", "vote=", vote, "f0=", f0);
                         con_hex2("    ", "v0=", v0, "f1=", f1);
+                        con_hex2("    ", "v1=", v1, "ps=", rd32(b + 0x920u));
                 }
         }
+}
+
+/* Dependent multiply chain: ~1 iteration per 3-4 cycles on A55/A76. */
+static void cpu_bench(void)
+{
+        const uint32_t n = 1000000u;
+        uint32_t acc = 1;
+        uint64_t t0 = now();
+        for (uint32_t i = 0; i < n; i++) {
+                acc = acc * 1664525u + 1013904223u;
+        }
+        uint64_t t1 = now();
+        uint32_t us = to_us(t1 - t0);
+        /* iters per microsecond ~= core MHz / 4 */
+        con_hex2("BENCH", "us=", us, "acc=", acc);
+        con_hex2("BENCH", "iters/us=", us ? (n / us) : 0, "n=", n);
 }
 
 void shim_main(uint64_t dtb)
@@ -556,8 +575,9 @@ void shim_main(uint64_t dtb)
         con_skip();
         /* Read-only EPSS snapshot; hold the screen so it can be photographed. */
         cpuclk_dump();
+        cpu_bench();
         con_skip();
-        delay_ms(4000);
+        delay_ms(6000);
 
         const char *why = loader_boot(dtb);
         con_str("LOADER", why);
