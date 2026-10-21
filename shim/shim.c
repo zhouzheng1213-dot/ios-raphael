@@ -502,6 +502,32 @@ static uint32_t to_us(uint64_t ticks)
         return ticks * 10 / 192;        /* 19.2 MHz */
 }
 
+/*
+ * EPSS (CPU performance state) snapshot.
+ *
+ * XNU has no cpufreq driver on this port, so the CPUs keep whatever OPP ABL
+ * left behind. SM8150 exposes three EPSS domains (4x A55 / 3x A76 gold /
+ * 1x A76 prime); the EPSS register layout is freq_lut=0x100, volt_lut=0x200,
+ * perf_state=0x320 (drivers/cpufreq/qcom-cpufreq-hw.c -- NOT the older OSM
+ * layout). Read only: print the live domain state and the first LUT words so
+ * the frequency can be decoded offline before anything is ever written.
+ */
+static void epss_dump(void)
+{
+        static const uintptr_t dom[3] = {
+                0x18323000UL, 0x18325800UL, 0x18327800UL
+        };
+        static const char *name[3] = { "EPSS0", "EPSS1", "EPSS2" };
+        for (unsigned i = 0; i < 3; i++) {
+                uint32_t st = rd32(dom[i] + 0x320u);
+                uint32_t l0 = rd32(dom[i] + 0x100u);
+                uint32_t l1 = rd32(dom[i] + 0x104u);
+                uint32_t l2 = rd32(dom[i] + 0x108u);
+                con_hex2(name[i], "st=", st, "l0=", l0);
+                con_hex2("     ", "l1=", l1, "l2=", l2);
+        }
+}
+
 void shim_main(uint64_t dtb)
 {
         struct mmu_info mi;
@@ -520,6 +546,11 @@ void shim_main(uint64_t dtb)
         con_clear(RED);
         con_str("SHIM", "sweet milestone 4: xnu loader");
         con_skip();
+        /* Read-only EPSS snapshot; hold the screen so it can be photographed. */
+        epss_dump();
+        con_skip();
+        delay_ms(4000);
+
         const char *why = loader_boot(dtb);
         con_str("LOADER", why);
         con_skip();
