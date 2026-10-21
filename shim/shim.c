@@ -503,40 +503,23 @@ static uint32_t to_us(uint64_t ticks)
 }
 
 /*
- * CPU clock + speed probe.
+ * GPU presence probe (Adreno a640).
  *
- * Registers (vendor DT: clock_cpucc / qcom,clk-cpu-osm, and the OSM variant
- * in drivers/cpufreq/qcom-cpufreq-hw.c):
- *   osm_pwrcl_base    0x18323000 (4x A55)   osm_perfcl_base  0x18325800
- *   osm_perfpcl_base  0x18327800 (1x A76)   freq LUT 0x110, volt LUT 0x114
- *   LUT stride 32 bytes, current vote 0x704 (low 10 bits), perf_state 0x920
- * The register reads are informational; the loop below is the hard evidence,
- * since it measures the core speed without trusting any decode.
+ * Vendor DT: qcom,kgsl-3d0@2C00000
+ *   kgsl_3d0_reg_memory  0x2c00000  (0x40000)  <- RBBM block, word 0 = VERSION
+ *   cx_dbgc              0x2c61000  (0x800)
+ *   qdss_gfx             0x6900000  (0x44000)
+ * RBBM_VERSION is the gate: a live a640 returns a 0x0MMmmppp style id, an
+ * unpowered or unclocked block reads back all zero. Read only.
  */
-static void cpuclk_dump(void)
+static void gpu_dump(void)
 {
-        for (unsigned i = 0; i < 3; i++) {
-                uintptr_t b = (i == 0) ? 0x18323000UL :
-                    (i == 1) ? 0x18325800UL : 0x18327800UL;
-                uint32_t vote = rd32(b + 0x704u) & 0x3ffu;
-                uint32_t f0 = rd32(b + 0x110u);
-                uint32_t v0 = rd32(b + 0x114u);
-                uint32_t f1 = rd32(b + 0x130u);   /* +32, the real entry 1 */
-                uint32_t v1 = rd32(b + 0x134u);
-                if (i == 0) {
-                        con_hex2("OSM0", "vote=", vote, "f0=", f0);
-                        con_hex2("    ", "v0=", v0, "f1=", f1);
-                        con_hex2("    ", "v1=", v1, "ps=", rd32(b + 0x920u));
-                } else if (i == 1) {
-                        con_hex2("OSM1", "vote=", vote, "f0=", f0);
-                        con_hex2("    ", "v0=", v0, "f1=", f1);
-                        con_hex2("    ", "v1=", v1, "ps=", rd32(b + 0x920u));
-                } else {
-                        con_hex2("OSM2", "vote=", vote, "f0=", f0);
-                        con_hex2("    ", "v0=", v0, "f1=", f1);
-                        con_hex2("    ", "v1=", v1, "ps=", rd32(b + 0x920u));
-                }
-        }
+        const uintptr_t gpu = 0x2c00000UL;
+        const uintptr_t dbgc = 0x2c61000UL;
+        con_hex2("GPU", "v0=", rd32(gpu + 0x00u), "v1=", rd32(gpu + 0x04u));
+        con_hex2("   ", "v2=", rd32(gpu + 0x08u), "v3=", rd32(gpu + 0x0cu));
+        con_hex2("   ", "v4=", rd32(gpu + 0x10u), "v5=", rd32(gpu + 0x14u));
+        con_hex2("   ", "dbgc=", rd32(dbgc), "gpucc=", rd32(0x5090000UL));
 }
 
 /* Dependent multiply chain: ~1 iteration per 3-4 cycles on A55/A76. */
@@ -574,7 +557,7 @@ void shim_main(uint64_t dtb)
         con_str("SHIM", "sweet milestone 4: xnu loader");
         con_skip();
         /* Read-only EPSS snapshot; hold the screen so it can be photographed. */
-        cpuclk_dump();
+        gpu_dump();
         cpu_bench();
         con_skip();
         delay_ms(6000);
