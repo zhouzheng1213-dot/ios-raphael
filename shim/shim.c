@@ -514,16 +514,23 @@ static uint32_t to_us(uint64_t ticks)
  */
 static void epss_dump(void)
 {
-        static const uintptr_t dom[3] = {
-                0x18323000UL, 0x18325800UL, 0x18327800UL
-        };
-        static const char *name[3] = { "EPSS0", "EPSS1", "EPSS2" };
+        /* No static pointer/constant arrays: the shim is linked without a
+         * dynamic linker and the linker rejects absolute relocations, so
+         * every address here is formed in a register. */
         for (unsigned i = 0; i < 3; i++) {
-                uint32_t st = rd32(dom[i] + 0x320u);
-                uint32_t l0 = rd32(dom[i] + 0x100u);
-                uint32_t l1 = rd32(dom[i] + 0x104u);
-                uint32_t l2 = rd32(dom[i] + 0x108u);
-                con_hex2(name[i], "st=", st, "l0=", l0);
+                uintptr_t base = (i == 0) ? 0x18323000UL :
+                    (i == 1) ? 0x18325800UL : 0x18327800UL;
+                uint32_t st = rd32(base + 0x320u);
+                uint32_t l0 = rd32(base + 0x100u);
+                uint32_t l1 = rd32(base + 0x104u);
+                uint32_t l2 = rd32(base + 0x108u);
+                if (i == 0) {
+                        con_hex2("EPSS0", "st=", st, "l0=", l0);
+                } else if (i == 1) {
+                        con_hex2("EPSS1", "st=", st, "l0=", l0);
+                } else {
+                        con_hex2("EPSS2", "st=", st, "l0=", l0);
+                }
                 con_hex2("     ", "l1=", l1, "l2=", l2);
         }
 }
