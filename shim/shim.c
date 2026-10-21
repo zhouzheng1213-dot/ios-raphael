@@ -503,35 +503,36 @@ static uint32_t to_us(uint64_t ticks)
 }
 
 /*
- * EPSS (CPU performance state) snapshot.
+ * CPU clock (OSM) snapshot.
  *
- * XNU has no cpufreq driver on this port, so the CPUs keep whatever OPP ABL
- * left behind. SM8150 exposes three EPSS domains (4x A55 / 3x A76 gold /
- * 1x A76 prime); the EPSS register layout is freq_lut=0x100, volt_lut=0x200,
- * perf_state=0x320 (drivers/cpufreq/qcom-cpufreq-hw.c -- NOT the older OSM
- * layout). Read only: print the live domain state and the first LUT words so
- * the frequency can be decoded offline before anything is ever written.
+ * SM8150 exposes the CPU clock controller as qcom,clk-cpu-osm
+ * (vendor DT: clock_cpucc), i.e. the *OSM* register layout, not EPSS --
+ * so perf_state is at 0x920 and the frequency LUT at 0x110/0x118, while
+ * 0x320/0x100 belong to the newer EPSS blocks and read back as zero here.
+ *   osm_pwrcl_base   0x18323000  (4x A55)
+ *   osm_perfcl_base  0x18325800  (3x A76 gold)
+ *   osm_perfpcl_base 0x18327800  (1x A76 prime)
+ * Read only: nothing is written, the values are printed for decoding.
  */
-static void epss_dump(void)
+static void cpuclk_dump(void)
 {
-        /* No static pointer/constant arrays: the shim is linked without a
-         * dynamic linker and the linker rejects absolute relocations, so
-         * every address here is formed in a register. */
         for (unsigned i = 0; i < 3; i++) {
                 uintptr_t base = (i == 0) ? 0x18323000UL :
                     (i == 1) ? 0x18325800UL : 0x18327800UL;
-                uint32_t st = rd32(base + 0x320u);
-                uint32_t l0 = rd32(base + 0x100u);
-                uint32_t l1 = rd32(base + 0x104u);
-                uint32_t l2 = rd32(base + 0x108u);
+                uint32_t st = rd32(base + 0x920u);   /* current perf state */
+                uint32_t f0 = rd32(base + 0x110u);   /* LUT[0] freq/volt  */
+                uint32_t v0 = rd32(base + 0x114u);
+                uint32_t f1 = rd32(base + 0x118u);   /* LUT[1] freq       */
                 if (i == 0) {
-                        con_hex2("EPSS0", "st=", st, "l0=", l0);
+                        con_hex2("OSM0", "st=", st, "f0=", f0);
+                        con_hex2("    ", "v0=", v0, "f1=", f1);
                 } else if (i == 1) {
-                        con_hex2("EPSS1", "st=", st, "l0=", l0);
+                        con_hex2("OSM1", "st=", st, "f0=", f0);
+                        con_hex2("    ", "v0=", v0, "f1=", f1);
                 } else {
-                        con_hex2("EPSS2", "st=", st, "l0=", l0);
+                        con_hex2("OSM2", "st=", st, "f0=", f0);
+                        con_hex2("    ", "v0=", v0, "f1=", f1);
                 }
-                con_hex2("     ", "l1=", l1, "l2=", l2);
         }
 }
 
@@ -554,7 +555,7 @@ void shim_main(uint64_t dtb)
         con_str("SHIM", "sweet milestone 4: xnu loader");
         con_skip();
         /* Read-only EPSS snapshot; hold the screen so it can be photographed. */
-        epss_dump();
+        cpuclk_dump();
         con_skip();
         delay_ms(4000);
 
