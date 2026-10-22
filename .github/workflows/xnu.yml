@@ -157,3 +157,16 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      # The full artifact above is ~60 MB because out/ also carries the .link
+      # directory (134 MB static archive + dSYM). Flashing only needs the
+      # Mach-O, so publish a slim 7 MB copy next to it: on a slow link the
+      # difference is minutes per flash cycle.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel-only
+          path: |
+            out/kernel.development.raphael
+            out/SHA256SUMS
+          if-no-files-found: warn
