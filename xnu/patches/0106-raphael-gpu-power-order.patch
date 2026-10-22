@@ -1,0 +1,94 @@
+0106: raphael a640 GPU — power CX before the AHB branch, split GX from RBBM
+
+Hardware result from 0105 stage 2 on this phone: "ahb wait=-1 us" then
+"cx wait=1 us" with CX_HWCTRL going 0x5ff4 -> 0x80001fe0. The AHB branch
+sits in the CX domain, so enabling it while CX is collapsed always times
+out; CX powers up from HLOS with no RPMh vote and no TZ/PAS call.
+
+Reorder to CX -> AHB, re-read both after each step, and split the probe:
+3 now powers GX only, 4 adds the RBBM reads. One flash, one question.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1145,7 +1145,8 @@ out:
+  *
+  *   1  read-only snapshot of the GPUCC power and clock state
+  *   2  + enable the GPUCC AHB branch, power the CX GDSC
+- *   3  + power the GX GDSC, then read RBBM_VERSION
++ *   3  + power the GX GDSC (an experiment: the GMU owns GX)
++ *   4  + read RBBM_VERSION (the only reads that can hang the boot)
+  *
+  * Offsets and bits are taken from the pinned upstream sources, not analogy:
+  *   gpucc-sm8150.c  gpu_cx_gdsc.gdscr 0x106c, .gds_hw_ctrl 0x1540,
+@@ -1233,36 +1234,49 @@ sweet_gpu_probe(void)
+                 return;
+         }
+ 
+-        /* Stage 2: the AHB branch gates every later GPUCC access, so it goes
+-         * first, before anything is powered. */
+-        uint32_t v = sweet_gpu_rd(cc, SWEET_GPUCC_AHB_CBCR);
++        /* Stage 2: CX first. 0105 tried the AHB branch first and timed out, then
++         * powered CX in 1 us: the AHB clock lives in the CX domain, so gating it
++         * on while CX is collapsed can never succeed. */
++        uint32_t v = sweet_gpu_rd(cc, SWEET_GPUCC_CX_GDSCR);
++        sweet_gpu_wr(cc, SWEET_GPUCC_CX_GDSCR, v & ~SWEET_GDSC_COLLAPSE);
++        printf("SWEET GPU: cx wait=%d us\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_CX_HWCTRL, SWEET_GDSC_PWR_ON, true, 2000));
++        printf("SWEET GPU: CX_GDSCR now=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_CX_GDSCR));
++        printf("SWEET GPU: CX_HWCTRL now=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_CX_HWCTRL));
++
++        /* Only now can the AHB branch halt-free. Needs no RPMh vote on this
++         * board: the stage-2 run showed the CX rail is already inherited. */
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_AHB_CBCR);
+         if (!(v & 1u)) {
+                 sweet_gpu_wr(cc, SWEET_GPUCC_AHB_CBCR, v | 1u);
+         }
+         printf("SWEET GPU: ahb wait=%d us\n",
+             sweet_gpu_poll(cc, SWEET_GPUCC_AHB_CBCR, SWEET_GPUCC_CLK_OFF, false, 2000));
+-
+-        v = sweet_gpu_rd(cc, SWEET_GPUCC_CX_GDSCR);
+-        sweet_gpu_wr(cc, SWEET_GPUCC_CX_GDSCR, v & ~SWEET_GDSC_COLLAPSE);
+-        printf("SWEET GPU: cx wait=%d us\n",
+-            sweet_gpu_poll(cc, SWEET_GPUCC_CX_HWCTRL, SWEET_GDSC_PWR_ON, true, 2000));
+-        printf("SWEET GPU: CX_HWCTRL now=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_CX_HWCTRL));
++        printf("SWEET GPU: AHB_CBCR now=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_AHB_CBCR));
+         if (level < 3) {
+                 return;
+         }
+ 
+-        /* Stage 3: GX. Upstream flags this GDSC CLAMP_IO | AON_RESET and hands it
+-         * a do-nothing enable because the GMU owns GX, so this is an experiment
+-         * and not the vendor sequence. */
++        /* Stage 3: GX only. Upstream marks this GDSC CLAMP_IO | AON_RESET and
++         * hands it a do-nothing enable because the GMU owns GX, so unclamping and
++         * dropping collapse is an experiment, not the vendor sequence. Success is
++         * bit16 of 0x1010; leaving it clear just means the GMU must do it. */
+         v = sweet_gpu_rd(cc, SWEET_GPUCC_GX_CLAMP);
+         sweet_gpu_wr(cc, SWEET_GPUCC_GX_CLAMP, v & ~1u);
+         v = sweet_gpu_rd(cc, SWEET_GPUCC_GX_GDSCR);
+         sweet_gpu_wr(cc, SWEET_GPUCC_GX_GDSCR, v & ~SWEET_GDSC_COLLAPSE);
+         printf("SWEET GPU: gx wait=%d us\n",
+             sweet_gpu_poll(cc, SWEET_GPUCC_GX_STATUS, SWEET_GDSC_UP_COMPLETE, true, 2000));
++        printf("SWEET GPU: GX_GDSCR now=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_GX_GDSCR));
+         printf("SWEET GPU: GX_STATUS now=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_GX_STATUS));
++        printf("SWEET GPU: GX_CLAMP now=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_GX_CLAMP));
++        if (level < 4) {
++                return;
++        }
+ 
+-        /* Last line before the only read that can hang this boot. */
++        /* Stage 4: the only reads that can hang this boot, so they go last and
++         * keep their own breadcrumb. With CX and AHB up the block has a clock, so
++         * a zero here means "GX not powered", not "bus dead". */
+         printf("SWEET GPU: reading rbbm\n");
+         vm_offset_t gpu = ml_io_map(SWEET_GPU_GPU_PA, SWEET_GPU_GPU_SIZE);
+         if (!gpu) {
+@@ -1272,6 +1286,7 @@ sweet_gpu_probe(void)
+         printf("SWEET GPU: RBBM_VERSION=%#x\n", sweet_gpu_rd(gpu, SWEET_GPU_RBBM_VERSION));
+         printf("SWEET GPU: RBBM_STATUS=%#x\n", sweet_gpu_rd(gpu, SWEET_GPU_RBBM_STATUS));
+ }
++
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
+ 
+ void
