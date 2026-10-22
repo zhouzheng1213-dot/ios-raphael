@@ -1,0 +1,147 @@
+0117: dump the RPMh command DB, because the rail names cannot fit in it
+
+Stage 11 proved the CX domain is unpowered rather than unclocked: enabling
+0x1088/0x108c/0x107c/0x1004 does not even stick, while 0x1124 in the same
+GPUCC block takes a write and latches - writes into a collapsed domain are
+dropped, writes into the always-on rows are not. So the CX rail has to be
+voted, and the vote dies before any TCS is touched.
+
+The reason is in the table layout. cmd-db entries carry an eight byte name
+(`u8 id[8]`), and rh_lookup() pads its query to exactly that width, so a
+sixteen character "pm8150l_s6_level" can never match - which is precisely
+the answer the log has been giving: matches=0, twice, for both rails.
+
+This stage maps the locator, maps the table, and prints every slave header
+and every entry's name and address, with no slave filter and no per-entry
+whitelist in the way. If "s6_level" or "s4_level" is among them, it votes
+both at NOM through the existing path and re-reads CX_GDSCR and CM3_CFG;
+if not, the dump itself is the input for the next stage. Read-only apart
+from the vote, and the vote only happens when a name was actually found.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index c24e6db..c7609a2 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1235,6 +1235,14 @@ out:
+ #define SWEET_GPUCC_CRC_AHB_CBCR     0x107cu
+ #define SWEET_GPUCC_CX_APB_CBCR      0x1088u
+ #define SWEET_GPUCC_CX_SNOC_DVM_CBCR 0x108cu
++/* RPMh command DB, as the soc/qcom/cmd-db.c reader sees it: the locator holds
++ * {pa, size}, the table starts with a header of MAX_SLV_ID=8 per-slave records,
++ * and every entry is 24 bytes of {u8 name[8], u32 priority[2], u32 addr,
++ * u16 len, u16 offset}. The name field is eight bytes wide. */
++#define SWEET_RPMH_DICT_PA   0x0c3f000cu
++#define SWEET_CMD_DB_HEADER  144u
++#define SWEET_CMD_DB_ENTRY   24u
++#define SWEET_CMD_DB_SLAVES  8u
+ 
+ static uint32_t
+ sweet_gpu_rd(vm_offset_t base, uint32_t off)
+@@ -1262,6 +1270,13 @@ sweet_gpu_poll(vm_offset_t base, uint32_t off, uint32_t mask, bool want, unsigne
+         return -1;
+ }
+ 
++/* Bounds check against the mapped cmd-db, so a corrupt count cannot walk off it. */
++static bool
++sweet_db_range(uint32_t size, uint32_t off, uint32_t len)
++{
++        return off <= size && len <= size - off;
++}
++
+ static void
+ sweet_gpu_probe(void)
+ {
+@@ -1683,6 +1698,93 @@ sweet_gpu_probe(void)
+         printf("SWEET GMU: S11 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
+         printf("SWEET GMU: S11 HFI_VERSION_INFO=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HFI_VERSION_INFO));
+         printf("SWEET GPU: s11 done\n");
++        if (level < 12) {
++                return;
++        }
++
++        /* Stage 12: stage 11 left one explanation standing - the CX rail carries
++         * no voltage, so writes into that domain are dropped while the always-on
++         * rows (the RCG, ahb, cx_gmu) still take theirs. The vote that would fix
++         * it dies inside rh_lookup() before a TCS is touched, and the table
++         * layout says why: cmd-db names are eight bytes wide, while the rail was
++         * looked up as "pm8150l_s6_level". Dump the table raw - no slave filter,
++         * no per-entry whitelist - so the real names are on the record. */
++        printf("SWEET GPU: s12 cmd-db census start\n");
++        uint32_t dict_off = SWEET_RPMH_DICT_PA & 0xfffu;
++        vm_offset_t dict = ml_io_map(SWEET_RPMH_DICT_PA & ~0xfffu, 0x1000u);
++        if (!dict) {
++                printf("SWEET GPU: s12 dict map failed\n");
++                return;
++        }
++        uint32_t db_pa = sweet_gpu_rd(dict, dict_off);
++        uint32_t db_size = sweet_gpu_rd(dict, dict_off + 4u);
++        printf("SWEET DB: locator pa=%#x size=%#x\n", db_pa, db_size);
++        if (db_pa < 0x80000000u || (db_pa & 3u) || db_size < SWEET_CMD_DB_HEADER ||
++            db_size > 0x100000u) {
++                printf("SWEET DB: locator implausible; stopping\n");
++                return;
++        }
++        vm_offset_t db = ml_io_map(db_pa, db_size);
++        if (!db) {
++                printf("SWEET DB: map failed\n");
++                return;
++        }
++        printf("SWEET DB: version=%#x magic=%#x checksum=%#x\n",
++            sweet_gpu_rd(db, 0), sweet_gpu_rd(db, 4), sweet_gpu_rd(db, 136));
++
++        /* Addresses of the two rails, if the eight-byte names exist at all. */
++        uint32_t cx_addr = 0, mx_addr = 0;
++        for (unsigned i = 0; i < SWEET_CMD_DB_SLAVES; ++i) {
++                uint32_t h = 8u + 16u * i;
++                unsigned slave = sweet_gpu_rd(db, h) & 0xffffu;
++                if (!slave) {
++                        break;
++                }
++                unsigned count = sweet_gpu_rd(db, h + 6u) & 0xffffu;
++                uint32_t ents = SWEET_CMD_DB_HEADER + (sweet_gpu_rd(db, h + 2u) & 0xffffu);
++                uint32_t data = SWEET_CMD_DB_HEADER + (sweet_gpu_rd(db, h + 4u) & 0xffffu);
++                printf("SWEET DB: slv=%u n=%u entries=%#x data=%#x ver=%#x\n",
++                    slave, count, ents, data, sweet_gpu_rd(db, h + 8u) & 0xffffu);
++                if (count > 64u || !sweet_db_range(db_size, ents, count * SWEET_CMD_DB_ENTRY)) {
++                        printf("SWEET DB: slv=%u entry table out of range; skipping\n", slave);
++                        continue;
++                }
++                for (unsigned j = 0; j < count; ++j) {
++                        uint32_t e = ents + SWEET_CMD_DB_ENTRY * j;
++                        uint32_t w0 = sweet_gpu_rd(db, e);
++                        uint32_t w1 = sweet_gpu_rd(db, e + 4u);
++                        char raw[8], name[9];
++                        memcpy(raw, &w0, 4);
++                        memcpy(raw + 4, &w1, 4);
++                        for (unsigned k = 0; k < 8; ++k) {
++                                name[k] = (raw[k] >= 0x20 && raw[k] < 0x7f) ? raw[k] : '.';
++                        }
++                        name[8] = 0;
++                        uint32_t addr = sweet_gpu_rd(db, e + 16u);
++                        printf("SWEET DB:   %s %#x\n", name, addr);
++                        if (memcmp(raw, "s6_level", 8) == 0) {
++                                cx_addr = addr;
++                        } else if (memcmp(raw, "s4_level", 8) == 0) {
++                                mx_addr = addr;
++                        }
++                }
++        }
++        printf("SWEET DB: cx=%#x mx=%#x\n", cx_addr, mx_addr);
++
++        /* A hit means the eight-byte name was the whole problem. Vote at NOM
++         * through the existing path, then give the four CX branches another
++         * chance and ask the core window again. */
++        if (cx_addr && mx_addr) {
++                printf("SWEET GPU: S12 vote cx err=%d\n",
++                    sweet_rpmh_level_vote("s6_level", 128));
++                printf("SWEET GPU: S12 vote mx err=%d\n",
++                    sweet_rpmh_level_vote("s4_level", 128));
++                delay(1000);
++                printf("SWEET GMU: S12 CX_GDSCR=%#x CM3_CFG=%#x\n",
++                    sweet_gpu_rd(cc, SWEET_GPUCC_CX_GDSCR),
++                    sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
++        }
++        printf("SWEET GPU: s12 done\n");
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
