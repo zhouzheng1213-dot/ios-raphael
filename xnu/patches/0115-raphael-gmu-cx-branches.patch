@@ -1,0 +1,104 @@
+0115: open the four CX branches, including the GMU APB clock
+
+Stage 9 wrote 1 to GMU_SYS_BUS_CONFIG and read back 0, then wrote
+CGC_MODE_CNTL and read back 0x20202: one GMU window drops writes, the
+other holds them. Stage 10 programmed gpu_cc_gmu_clk_src (0x1124 stuck,
+0x1120 self-cleared) and changed nothing. So the split is by window, not
+by clock root - and gpucc-sm8250.c names the missing branch:
+gpu_cc_cx_apb_clk at 0x1088 has been enabled=0, halt=1 since boot, and
+that is the APB slave clock the whole core window (0x13000+) sits behind.
+
+Enable it, plus the three other CX branches this driver never touched
+(cxo_aon 0x1004, crc_ahb 0x107c, cx_snoc_dvm 0x108c), then read CM3_CFG:
+a Cortex-M3 reset default there is the first proof the core window is
+real rather than a hole in the interconnect. If it answers, the same
+closing sequence runs against a window that can hold values; if it does
+not, the CX/MX rail vote is the only lead left.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index be7a591..af8c67e 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1227,6 +1227,14 @@ out:
+ #define SWEET_GPUCC_GMU_M_REG    0x1128u
+ #define SWEET_GPUCC_GMU_N_REG    0x112cu
+ #define SWEET_GPUCC_GMU_D_REG    0x1130u
++/* The CX-side branches gpucc-sm8250.c declares. ahb/cx_gmu/cxo are the three
++ * that always got enabled; these four were never touched, and 0x1088 in
++ * particular is the GMU APB slave clock without which the whole core window
++ * (0x13000+) drops writes and reads back zero. */
++#define SWEET_GPUCC_CXO_AON_CBCR     0x1004u
++#define SWEET_GPUCC_CRC_AHB_CBCR     0x107cu
++#define SWEET_GPUCC_CX_APB_CBCR      0x1088u
++#define SWEET_GPUCC_CX_SNOC_DVM_CBCR 0x108cu
+ 
+ static uint32_t
+ sweet_gpu_rd(vm_offset_t base, uint32_t off)
+@@ -1611,6 +1619,67 @@ sweet_gpu_probe(void)
+         printf("SWEET GMU: S10 CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
+         printf("SWEET GMU: S10 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
+         printf("SWEET GPU: s10 done\n");
++        if (level < 11) {
++                return;
++        }
++
++        /* Stage 11: stages 9 and 10 disagreed in a way that names the bug. A
++         * write to the AO window (0x24c24) stuck and read back, while 0x1303c and
++         * every CM3 register dropped theirs, and the root clock programmed in
++         * stage 10 changed nothing. gpucc-sm8250.c says why: the core window
++         * hangs off gpu_cc_cx_apb_clk at 0x1088, which has been enabled=0,
++         * halt=1 since boot. Open the four CX branches this driver never touched
++         * and see whether the core window starts answering. */
++        printf("SWEET GPU: s11 cx branches start\n");
++        static const uint32_t cx_branches[] = {
++                SWEET_GPUCC_CXO_AON_CBCR,
++                SWEET_GPUCC_CRC_AHB_CBCR,
++                SWEET_GPUCC_CX_APB_CBCR,
++                SWEET_GPUCC_CX_SNOC_DVM_CBCR,
++        };
++        for (unsigned i = 0; i < sizeof(cx_branches) / sizeof(cx_branches[0]); ++i) {
++                uint32_t off = cx_branches[i];
++                uint32_t cur = sweet_gpu_rd(cc, off);
++                printf("SWEET CC: S11 %04x pre=%#x\n", off, cur);
++                if (!(cur & 1u)) {
++                        sweet_gpu_wr(cc, off, cur | 1u);
++                }
++                printf("SWEET CC: S11 %04x now=%#x\n", off, sweet_gpu_rd(cc, off));
++        }
++        printf("SWEET CC: S11 rcgr cmd=%#x cfg=%#x\n",
++            sweet_gpu_rd(cc, SWEET_GPUCC_GMU_CMD_RCGR),
++            sweet_gpu_rd(cc, SWEET_GPUCC_GMU_CFG_RCGR));
++
++        /* The core window's first honest answer: CM3_CFG only holds a
++         * Cortex-M3 reset default once its APB clock is running. */
++        uint32_t core = 0;
++        for (unsigned s = 0; s < 8; ++s) {
++                uint32_t cfg = sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG);
++                core |= cfg;
++                printf("SWEET GMU: S11 CM3_CFG[%u]=%#x\n", s, cfg);
++                delay(1000);
++        }
++        printf("SWEET GPU: s11 core alive=%d\n", core != 0);
++        if (!core) {
++                printf("SWEET GPU: s11 cx branches did not wake the core window\n");
++                return;
++        }
++
++        /* Same closing sequence as stage 10, now against a window that can hold
++         * a value: bus buffers, AO gating, reset release, and the
++         * invalid-firmware code as the only expected result without firmware. */
++        sweet_gpu_wr(gmu, SWEET_GMU_SYS_BUS_CONFIG, 1u);
++        printf("SWEET GMU: S11 SYS_BUS_CONFIG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_SYS_BUS_CONFIG));
++        sweet_gpu_wr(gmu, SWEET_GMU_CGC_MODE_CNTL, 0x20202u);
++        printf("SWEET GMU: S11 CGC_MODE_CNTL=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
++        sweet_gpu_wr(gmu, SWEET_GMU_PWR_COL_CP_RESP, 0u);
++        sweet_gpu_wr(gmu, SWEET_GMU_CM3_SYSRESET, 0u);
++        delay(2000);
++        printf("SWEET GMU: S11 CM3_SYSRESET=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET));
++        printf("SWEET GMU: S11 CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
++        printf("SWEET GMU: S11 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
++        printf("SWEET GMU: S11 HFI_VERSION_INFO=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HFI_VERSION_INFO));
++        printf("SWEET GPU: s11 done\n");
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
