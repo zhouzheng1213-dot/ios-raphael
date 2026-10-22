@@ -1,0 +1,171 @@
+0105: raphael a640 GPU access path (CX/GX GDSC + GPUCC AHB)
+
+Adds an opt-in, staged probe to sweet_touch.c: no new file, no
+bsd/conf/files change, default off (sweetgpu=0). Stage 1 only reads
+GPUCC state; stage 2 enables the AHB branch and powers CX; stage 3
+powers GX and reads RBBM_VERSION last, because that read is the one
+that can stall the bus.
+
+Status locations differ per GDSC on this chip (CX: 0x1540 bit31,
+GX: 0x1010 bit16), so the handoff plan's "poll bit31 of the same
+register" can never observe either domain coming up.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1137,6 +1137,143 @@ out:
+         thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++/*
++ * GPU bring-up probe (a640 / SM8150). Off by default: reading a block whose
++ * rail or clock is off can stall the bus instead of failing, and a stall costs
++ * a reboot. sweetgpu=<n> stages it, one hardware step per level:
++ *
++ *   1  read-only snapshot of the GPUCC power and clock state
++ *   2  + enable the GPUCC AHB branch, power the CX GDSC
++ *   3  + power the GX GDSC, then read RBBM_VERSION
++ *
++ * Offsets and bits are taken from the pinned upstream sources, not analogy:
++ *   gpucc-sm8150.c  gpu_cx_gdsc.gdscr 0x106c, .gds_hw_ctrl 0x1540,
++ *                   gpu_gx_gdsc.gdscr 0x100c, .clamp_io_ctrl 0x1508,
++ *                   gpu_cc_ahb_clk 0x1078
++ *   gdsc.c          SW_COLLAPSE BIT(0), PWR_ON BIT(31), POLL_CFG_GDSCR
++ *                   means "read status at gdscr + 4, bit 16"
++ *
++ * The two GDSCs do not share a status location, which is the trap: CX is
++ * VOTABLE and reports on gds_hw_ctrl (0x1540) bit 31, while GX sets
++ * POLL_CFG_GDSCR and reports at 0x1010 bit 16. Polling bit 31 of 0x106c or
++ * 0x100c would never see either domain come up.
++ */
++#define SWEET_GPU_GPUCC_PA   0x02c90000u
++#define SWEET_GPU_GPUCC_SIZE 0x9000u
++#define SWEET_GPU_GPU_PA     0x02c00000u
++#define SWEET_GPU_GPU_SIZE   0x1000u
++
++#define SWEET_GPUCC_AHB_CBCR  0x1078u
++#define SWEET_GPUCC_CX_GDSCR  0x106cu
++#define SWEET_GPUCC_CX_HWCTRL 0x1540u
++#define SWEET_GPUCC_GX_GDSCR  0x100cu
++#define SWEET_GPUCC_GX_STATUS 0x1010u
++#define SWEET_GPUCC_GX_CLAMP  0x1508u
++
++#define SWEET_GDSC_COLLAPSE    (1u << 0)
++#define SWEET_GDSC_PWR_ON      (1u << 31)
++#define SWEET_GDSC_UP_COMPLETE (1u << 16)
++#define SWEET_GPUCC_CLK_OFF    (1u << 31)
++
++#define SWEET_GPU_RBBM_VERSION 0x0000u
++#define SWEET_GPU_RBBM_STATUS  0x0210u
++
++static uint32_t
++sweet_gpu_rd(vm_offset_t base, uint32_t off)
++{
++        return *(volatile uint32_t *)(base + (vm_offset_t)off);
++}
++
++static void
++sweet_gpu_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++        *(volatile uint32_t *)(base + (vm_offset_t)off) = val;
++        __asm__ __volatile__("dsb sy" ::: "memory");
++}
++
++/* Returns the microseconds waited on success, -1 on timeout. */
++static int
++sweet_gpu_poll(vm_offset_t base, uint32_t off, uint32_t mask, bool want, unsigned us)
++{
++        for (unsigned i = 0; i < us; ++i) {
++                if ((sweet_gpu_rd(base, off) & mask) == (want ? mask : 0u)) {
++                        return (int)i;
++                }
++                delay(1);
++        }
++        return -1;
++}
++
++static void
++sweet_gpu_probe(void)
++{
++        int level = 0;
++        (void)PE_parse_boot_argn("sweetgpu", &level, sizeof(level));
++        if (level < 1) {
++                return;
++        }
++        printf("SWEET GPU: probe start level=%d\n", level);
++        vm_offset_t cc = ml_io_map(SWEET_GPU_GPUCC_PA, SWEET_GPU_GPUCC_SIZE);
++        if (!cc) {
++                printf("SWEET GPU: gpucc map failed\n");
++                return;
++        }
++        printf("SWEET GPU: gpucc=%#lx\n", (unsigned long)cc);
++
++        /* Stage 1: one register per line. A dead block reads 0 or 0xffffffff,
++         * and a bus stall loses only this line. */
++        printf("SWEET GPU: AHB_CBCR=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_AHB_CBCR));
++        printf("SWEET GPU: CX_GDSCR=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_CX_GDSCR));
++        printf("SWEET GPU: CX_HWCTRL=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_CX_HWCTRL));
++        printf("SWEET GPU: GX_GDSCR=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_GX_GDSCR));
++        printf("SWEET GPU: GX_STATUS=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_GX_STATUS));
++        printf("SWEET GPU: GX_CLAMP=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_GX_CLAMP));
++        if (level < 2) {
++                return;
++        }
++
++        /* Stage 2: the AHB branch gates every later GPUCC access, so it goes
++         * first, before anything is powered. */
++        uint32_t v = sweet_gpu_rd(cc, SWEET_GPUCC_AHB_CBCR);
++        if (!(v & 1u)) {
++                sweet_gpu_wr(cc, SWEET_GPUCC_AHB_CBCR, v | 1u);
++        }
++        printf("SWEET GPU: ahb wait=%d us\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_AHB_CBCR, SWEET_GPUCC_CLK_OFF, false, 2000));
++
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_CX_GDSCR);
++        sweet_gpu_wr(cc, SWEET_GPUCC_CX_GDSCR, v & ~SWEET_GDSC_COLLAPSE);
++        printf("SWEET GPU: cx wait=%d us\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_CX_HWCTRL, SWEET_GDSC_PWR_ON, true, 2000));
++        printf("SWEET GPU: CX_HWCTRL now=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_CX_HWCTRL));
++        if (level < 3) {
++                return;
++        }
++
++        /* Stage 3: GX. Upstream flags this GDSC CLAMP_IO | AON_RESET and hands it
++         * a do-nothing enable because the GMU owns GX, so this is an experiment
++         * and not the vendor sequence. */
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_GX_CLAMP);
++        sweet_gpu_wr(cc, SWEET_GPUCC_GX_CLAMP, v & ~1u);
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_GX_GDSCR);
++        sweet_gpu_wr(cc, SWEET_GPUCC_GX_GDSCR, v & ~SWEET_GDSC_COLLAPSE);
++        printf("SWEET GPU: gx wait=%d us\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_GX_STATUS, SWEET_GDSC_UP_COMPLETE, true, 2000));
++        printf("SWEET GPU: GX_STATUS now=%#x\n", sweet_gpu_rd(cc, SWEET_GPUCC_GX_STATUS));
++
++        /* Last line before the only read that can hang this boot. */
++        printf("SWEET GPU: reading rbbm\n");
++        vm_offset_t gpu = ml_io_map(SWEET_GPU_GPU_PA, SWEET_GPU_GPU_SIZE);
++        if (!gpu) {
++                printf("SWEET GPU: gpu map failed\n");
++                return;
++        }
++        printf("SWEET GPU: RBBM_VERSION=%#x\n", sweet_gpu_rd(gpu, SWEET_GPU_RBBM_VERSION));
++        printf("SWEET GPU: RBBM_STATUS=%#x\n", sweet_gpu_rd(gpu, SWEET_GPU_RBBM_STATUS));
++}
++#endif /* ARM64_BOARD_CONFIG_RAPHAEL */
++
+ void
+ sweet_touch_init(void)
+ {
+@@ -1146,6 +1283,11 @@ sweet_touch_init(void)
+                 return;
+         }
+         st.started = true;
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++        /* Opt-in and independent of sweettouch: a GPU stall must not be
++         * mistaken for a touch problem. */
++        sweet_gpu_probe();
++#endif
+         (void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+         (void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+         if (!enabled) {
