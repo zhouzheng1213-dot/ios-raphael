@@ -1,0 +1,73 @@
+0107: raphael a640 GMU reconnaissance (clock the block, dump 1 KiB)
+
+M1a closed the HLOS half of the power path: CX up in 1 us, AHB clock
+in 0 us, GX refuses to come up because the GMU owns it. M1b therefore
+has to boot the GMU, and the GMU register map for a640 has no public
+numeric header. This stage turns on GPU_CC_CXO and GPU_CC_CX_GMU and
+dumps the first KiB of 0x2c6a000 so the map can be identified from
+values. No firmware load, no HFI traffic, nothing written to the GMU.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1180,6 +1180,14 @@ out:
+ #define SWEET_GPU_RBBM_VERSION 0x0000u
+ #define SWEET_GPU_RBBM_STATUS  0x0210u
+ 
++/* GMU: vendor DT qcom,gmu@0x2C6A000 reg[0] 0x2c6a000 size 0x30000. The GMU
++ * register map for a640 has no public numeric header, so stage 5 dumps the
++ * first KiB instead of inventing offsets. */
++#define SWEET_GPU_GMU_PA   0x02c6a000u
++#define SWEET_GPU_GMU_SIZE 0x0400u
++#define SWEET_GPUCC_CX_GMU_CBCR 0x1098u
++#define SWEET_GPUCC_CXO_CBCR    0x109cu
++
+ static uint32_t
+ sweet_gpu_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -1285,6 +1293,45 @@ sweet_gpu_probe(void)
+         }
+         printf("SWEET GPU: RBBM_VERSION=%#x\n", sweet_gpu_rd(gpu, SWEET_GPU_RBBM_VERSION));
+         printf("SWEET GPU: RBBM_STATUS=%#x\n", sweet_gpu_rd(gpu, SWEET_GPU_RBBM_STATUS));
++        if (level < 5) {
++                return;
++        }
++
++        /* Stage 5: GMU reconnaissance, read-mostly. GPU_CC_CX_GMU gates the block
++         * and GPU_CC_CXO feeds its timer, so both go on first; then dump 1 KiB of
++         * the GMU window so the real map can be identified from values rather
++         * than guessed from documentation. No firmware is loaded and no HFI is
++         * touched here: this stage can only tell us what the block looks like. */
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_CXO_CBCR);
++        if (!(v & 1u)) {
++                sweet_gpu_wr(cc, SWEET_GPUCC_CXO_CBCR, v | 1u);
++        }
++        printf("SWEET GPU: cxo wait=%d us cbcr=%#x\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_CXO_CBCR, SWEET_GPUCC_CLK_OFF, false, 2000),
++            sweet_gpu_rd(cc, SWEET_GPUCC_CXO_CBCR));
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_CX_GMU_CBCR);
++        if (!(v & 1u)) {
++                sweet_gpu_wr(cc, SWEET_GPUCC_CX_GMU_CBCR, v | 1u);
++        }
++        printf("SWEET GPU: gmu clk wait=%d us cbcr=%#x\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_CX_GMU_CBCR, SWEET_GPUCC_CLK_OFF, false, 2000),
++            sweet_gpu_rd(cc, SWEET_GPUCC_CX_GMU_CBCR));
++
++        printf("SWEET GPU: dumping gmu\n");
++        vm_offset_t gmu = ml_io_map(SWEET_GPU_GMU_PA, SWEET_GPU_GMU_SIZE);
++        if (!gmu) {
++                printf("SWEET GPU: gmu map failed\n");
++                return;
++        }
++        for (uint32_t off = 0; off < SWEET_GPU_GMU_SIZE; off += 0x20u) {
++                printf("SWEET GMU: %03x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++                    off,
++                    sweet_gpu_rd(gmu, off), sweet_gpu_rd(gmu, off + 0x04u),
++                    sweet_gpu_rd(gmu, off + 0x08u), sweet_gpu_rd(gmu, off + 0x0cu),
++                    sweet_gpu_rd(gmu, off + 0x10u), sweet_gpu_rd(gmu, off + 0x14u),
++                    sweet_gpu_rd(gmu, off + 0x18u), sweet_gpu_rd(gmu, off + 0x1cu));
++        }
++        printf("SWEET GPU: gmu dump done\n");
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
