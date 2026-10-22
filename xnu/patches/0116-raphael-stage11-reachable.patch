@@ -1,0 +1,73 @@
+0116: let stage 11 run when stage 10 fails
+
+The first level-11 boot printed stage 9 and stage 10 and then stopped.
+Stage 10 treated "the root clock did not wake the block" as a dead end
+and returned, so the stage-11 code sitting below it never executed - the
+log had every line it should have had except the S11 ones, which is
+exactly the failure mode that is easy to read past.
+
+The two stages answer different halves of the same question: 10 asks
+whether the clock root feeds the block, 11 whether the CX APB branch
+does. Stage 11 has to run either way. The dead path now falls through,
+and only the closing sequence (bus buffers, AO gating, reset release)
+stays inside the alive branch, because that sequence is meaningless
+against a window that drops writes.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index af8c67e..c24e6db 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1595,29 +1595,32 @@ sweet_gpu_probe(void)
+         }
+         printf("SWEET GPU: s10 alive=%d\n", cfg_up != 0);
+         if (!cfg_up) {
++                /* Not a dead end: stage 11 asks the other half of the same
++                 * question, and returning here is exactly what swallowed it on
++                 * the first stage-11 boot. */
+                 printf("SWEET GPU: s10 clock root did not wake the block\n");
+-                return;
++        } else {
++                /* The block answers, so the vendor's pre-boot configuration
++                 * finally has something to land on: bus buffers, AO clock
++                 * gating, then the reset the CM3 has been held in. No firmware
++                 * is loaded, so the only outcome expected from the release is
++                 * the invalid-firmware code. */
++                printf("SWEET GMU: S10 wake CM3_SYSRESET=%#x HFI_VERSION_INFO=%#x AO=%#x\n",
++                    sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET),
++                    sweet_gpu_rd(gmu, SWEET_GMU_HFI_VERSION_INFO),
++                    sweet_gpu_rd(gmu, SWEET_GMU_AO_HOST_INTERRUPT_STATUS));
++                sweet_gpu_wr(gmu, SWEET_GMU_SYS_BUS_CONFIG, 1u);
++                sweet_gpu_wr(gmu, SWEET_GMU_CGC_MODE_CNTL, 0x20202u);
++                printf("SWEET GMU: S10 SYS_BUS_CONFIG=%#x CGC_MODE_CNTL=%#x\n",
++                    sweet_gpu_rd(gmu, SWEET_GMU_SYS_BUS_CONFIG),
++                    sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
++                sweet_gpu_wr(gmu, SWEET_GMU_PWR_COL_CP_RESP, 0u);
++                sweet_gpu_wr(gmu, SWEET_GMU_CM3_SYSRESET, 0u);
++                delay(2000);
++                printf("SWEET GMU: S10 CM3_SYSRESET=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET));
++                printf("SWEET GMU: S10 CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
++                printf("SWEET GMU: S10 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
+         }
+-
+-        /* The block answers, so the vendor's pre-boot configuration finally has
+-         * something to land on: bus buffers, AO clock gating, then the reset the
+-         * CM3 has been held in. No firmware is loaded, so the only outcome
+-         * expected from the release is the invalid-firmware code. */
+-        printf("SWEET GMU: S10 wake CM3_SYSRESET=%#x HFI_VERSION_INFO=%#x AO=%#x\n",
+-            sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET),
+-            sweet_gpu_rd(gmu, SWEET_GMU_HFI_VERSION_INFO),
+-            sweet_gpu_rd(gmu, SWEET_GMU_AO_HOST_INTERRUPT_STATUS));
+-        sweet_gpu_wr(gmu, SWEET_GMU_SYS_BUS_CONFIG, 1u);
+-        sweet_gpu_wr(gmu, SWEET_GMU_CGC_MODE_CNTL, 0x20202u);
+-        printf("SWEET GMU: S10 SYS_BUS_CONFIG=%#x CGC_MODE_CNTL=%#x\n",
+-            sweet_gpu_rd(gmu, SWEET_GMU_SYS_BUS_CONFIG),
+-            sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
+-        sweet_gpu_wr(gmu, SWEET_GMU_PWR_COL_CP_RESP, 0u);
+-        sweet_gpu_wr(gmu, SWEET_GMU_CM3_SYSRESET, 0u);
+-        delay(2000);
+-        printf("SWEET GMU: S10 CM3_SYSRESET=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET));
+-        printf("SWEET GMU: S10 CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
+-        printf("SWEET GMU: S10 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
+         printf("SWEET GPU: s10 done\n");
+         if (level < 11) {
+                 return;
