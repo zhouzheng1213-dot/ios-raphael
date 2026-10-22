@@ -1,0 +1,61 @@
+0118: stop hiding stages - stage 11 must not return on a negative result
+
+0117 never ran. The level-12 log ended at "s11 cx branches did not wake
+the core window", which is stage 11's own early return, so the cmd-db
+census printed nothing at all - the second time in three patches that a
+stage's failure path swallowed the next stage.
+
+The rule is now unconditional: only the level guard may return. Stage 11
+keeps its closing sequence inside the alive branch (bus buffers, AO
+gating and the reset release are meaningless against a window that drops
+writes) but a dead window no longer ends the boot, and "s11 done" prints
+either way so the next stage is visibly reachable.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index c7609a2..0316f10 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1679,24 +1679,27 @@ sweet_gpu_probe(void)
+         }
+         printf("SWEET GPU: s11 core alive=%d\n", core != 0);
+         if (!core) {
++                /* Same lesson as 0116, one stage later: a stage that returns on a
++                 * negative result hides every stage after it. Only the level
++                 * guard is allowed to return. */
+                 printf("SWEET GPU: s11 cx branches did not wake the core window\n");
+-                return;
++        } else {
++                /* Same closing sequence as stage 10, now against a window that can
++                 * hold a value: bus buffers, AO gating, reset release, and the
++                 * invalid-firmware code as the only expected result without
++                 * firmware. */
++                sweet_gpu_wr(gmu, SWEET_GMU_SYS_BUS_CONFIG, 1u);
++                printf("SWEET GMU: S11 SYS_BUS_CONFIG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_SYS_BUS_CONFIG));
++                sweet_gpu_wr(gmu, SWEET_GMU_CGC_MODE_CNTL, 0x20202u);
++                printf("SWEET GMU: S11 CGC_MODE_CNTL=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
++                sweet_gpu_wr(gmu, SWEET_GMU_PWR_COL_CP_RESP, 0u);
++                sweet_gpu_wr(gmu, SWEET_GMU_CM3_SYSRESET, 0u);
++                delay(2000);
++                printf("SWEET GMU: S11 CM3_SYSRESET=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET));
++                printf("SWEET GMU: S11 CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
++                printf("SWEET GMU: S11 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
++                printf("SWEET GMU: S11 HFI_VERSION_INFO=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HFI_VERSION_INFO));
+         }
+-
+-        /* Same closing sequence as stage 10, now against a window that can hold
+-         * a value: bus buffers, AO gating, reset release, and the
+-         * invalid-firmware code as the only expected result without firmware. */
+-        sweet_gpu_wr(gmu, SWEET_GMU_SYS_BUS_CONFIG, 1u);
+-        printf("SWEET GMU: S11 SYS_BUS_CONFIG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_SYS_BUS_CONFIG));
+-        sweet_gpu_wr(gmu, SWEET_GMU_CGC_MODE_CNTL, 0x20202u);
+-        printf("SWEET GMU: S11 CGC_MODE_CNTL=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
+-        sweet_gpu_wr(gmu, SWEET_GMU_PWR_COL_CP_RESP, 0u);
+-        sweet_gpu_wr(gmu, SWEET_GMU_CM3_SYSRESET, 0u);
+-        delay(2000);
+-        printf("SWEET GMU: S11 CM3_SYSRESET=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET));
+-        printf("SWEET GMU: S11 CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
+-        printf("SWEET GMU: S11 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
+-        printf("SWEET GMU: S11 HFI_VERSION_INFO=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HFI_VERSION_INFO));
+         printf("SWEET GPU: s11 done\n");
+         if (level < 12) {
+                 return;
