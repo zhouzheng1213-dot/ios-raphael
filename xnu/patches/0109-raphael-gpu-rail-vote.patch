@@ -1,0 +1,112 @@
+0109: vote the a640 CX/MX rails at NOM, then re-read the GMU
+
+0108 read 19 GMU registers at the Mesa offsets and every one was zero,
+AO block included, while GPUCC answered and its AHB branch could be
+toggled. A GDSC closes its switch whether or not the rail behind it has
+power, and this driver never voted CX or MX. Adds sweet_rpmh_level_vote()
+(same VRM triple as the LDO path, no per-rail whitelist, RPMH level not
+millivolts) and stage 6: vote, redo power, re-read the same registers.
+---
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -388,4 +388,42 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * Level rails take an RPMH level (SVS=48, NOM=128, NOM_L1=144), not a
++ * millivolt, and the caller names the resource because the OPP table owns the
++ * mapping. Same three-command VRM layout as the LDO path (offset 0 = value,
++ * 4 = enable, 8 = mode); only the per-rail whitelist is dropped, because the
++ * GPU rails are not LDOs and must not be range-checked like one.
++ */
++int
++sweet_rpmh_level_vote(const char *res, unsigned level)
++{
++	if (!res || !level || level > 0xffffu) {
++		printf("SWEET RPMH: bad level vote\n");
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, &address);
++	}
++	if (!error) {
++		error = rh_send(address, level);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: level vote failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -23,6 +23,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern int sweet_rpmh_level_vote(const char *res, unsigned level);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+@@ -1369,6 +1370,45 @@ sweet_gpu_probe(void)
+         printf("SWEET GMU: AHB_FENCE_STATUS=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_AHB_FENCE_STATUS));
+         printf("SWEET GMU: CGC_MODE_CNTL=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
+         printf("SWEET GPU: gmu state done\n");
++        if (level < 6) {
++                return;
++        }
++
++        /* Stage 6: every register above read zero, including the AO block, while
++         * GPUCC kept answering. A GDSC closes its switch whether or not the rail
++         * behind it carries power, so vote CX and MX at NOM, redo the sequence and
++         * read the same registers again. Equal values before and after mean the
++         * rail was not the blocker. */
++        printf("SWEET GPU: cx rail err=%d\n", sweet_rpmh_level_vote("pm8150l_s6_level", 128));
++        printf("SWEET GPU: mx rail err=%d\n", sweet_rpmh_level_vote("pm8150l_s4_level", 128));
++        delay(1000); /* rail settle: 1 ms, not a DT value */
++
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_CX_GDSCR);
++        sweet_gpu_wr(cc, SWEET_GPUCC_CX_GDSCR, v & ~SWEET_GDSC_COLLAPSE);
++        printf("SWEET GPU: cx2 wait=%d us\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_CX_HWCTRL, SWEET_GDSC_PWR_ON, true, 2000));
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_AHB_CBCR);
++        if (!(v & 1u)) {
++                sweet_gpu_wr(cc, SWEET_GPUCC_AHB_CBCR, v | 1u);
++        }
++        printf("SWEET GPU: ahb2 wait=%d us\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_AHB_CBCR, SWEET_GPUCC_CLK_OFF, false, 2000));
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_CX_GMU_CBCR);
++        if (!(v & 1u)) {
++                sweet_gpu_wr(cc, SWEET_GPUCC_CX_GMU_CBCR, v | 1u);
++        }
++        printf("SWEET GPU: gmu2 clk wait=%d us\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_CX_GMU_CBCR, SWEET_GPUCC_CLK_OFF, false, 2000));
++        delay(1000);
++
++        printf("SWEET GMU: R2 CM3_SYSRESET=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET));
++        printf("SWEET GMU: R2 CM3_CFG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
++        printf("SWEET GMU: R2 CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
++        printf("SWEET GMU: R2 HFI_VERSION_INFO=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HFI_VERSION_INFO));
++        printf("SWEET GMU: R2 AO_HOST_INTERRUPT_STATUS=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_AO_HOST_INTERRUPT_STATUS));
++        printf("SWEET GMU: R2 AHB_FENCE_STATUS=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_AHB_FENCE_STATUS));
++        printf("SWEET GMU: R2 CGC_MODE_CNTL=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
++        printf("SWEET GPU: gmu vote done\n");
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
