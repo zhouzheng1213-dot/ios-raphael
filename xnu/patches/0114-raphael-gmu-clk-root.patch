@@ -1,0 +1,122 @@
+0114: program the GMU clock root the stage-8 sweep left at zero
+
+The sweep printed 0x1120..0x1130 as eight zeros, and gpucc-sm8250.c names
+that row gpu_cc_gmu_clk_src: CMD_RCGR at 0x1120, CFG_RCGR at 0x1124. This
+driver has only ever flipped branch enables, never the root, so every GMU
+write since 0109 went into a block whose input clock was never started.
+That also explains the clock check that looked healthy: a branch whose
+parent is dead cannot acknowledge a halt, so 0x1098 reports "running"
+(bit31 clear) for a block that is receiving nothing.
+
+Set the root to 19.2 MHz off bi_tcxo - the first entry of the vendor's own
+gmu clock table - with the CM3 held in reset, then sample CM3_CFG. A value
+there is the first proof the read path is alive; a block that answers then
+gets the bus-buffer/AO configuration and the reset release, with the
+invalid-firmware code as the only expected result since no firmware is
+loaded. A block that stays silent with a live root stops the stage, so the
+CM3 is never left executing an empty ITCM, and the next move is the CX/MX
+rail vote that 0109 could not complete.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1217,6 +1217,16 @@ out:
+ #define SWEET_GMU_PWR_COL_CP_RESP          0x14404u
+ #define SWEET_GPUCC_CX_GMU_CBCR 0x1098u
+ #define SWEET_GPUCC_CXO_CBCR    0x109cu
++#define SWEET_GPUCC_GX_GMU_CBCR 0x1064u
++/* gpucc-sm8250.c: gpu_cc_gmu_clk_src.cmd_rcgr = 0x1120. An RCG takes its
++ * divider and source through CFG_RCGR and is latched by CMD_UPDATE (bit 0 of
++ * CMD_RCGR, self-clearing). M/N/D only exist for RCGs with mnd_width != 0;
++ * this one is half-integer only, so a division of 1 is CFG_RCGR = 1. */
++#define SWEET_GPUCC_GMU_CMD_RCGR 0x1120u
++#define SWEET_GPUCC_GMU_CFG_RCGR 0x1124u
++#define SWEET_GPUCC_GMU_M_REG    0x1128u
++#define SWEET_GPUCC_GMU_N_REG    0x112cu
++#define SWEET_GPUCC_GMU_D_REG    0x1130u
+ 
+ static uint32_t
+ sweet_gpu_rd(vm_offset_t base, uint32_t off)
+@@ -1525,6 +1535,82 @@ sweet_gpu_probe(void)
+                 delay(1000);
+         }
+         printf("SWEET GPU: s9 done alive=%d\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG) != 0);
++        if (level < 10) {
++                return;
++        }
++
++        /* Stage 10: the stage-8 sweep left one row of the clock window at zero,
++         * and gpucc-sm8250.c names 0x1120/0x1124 gpu_cc_gmu_clk_src's
++         * CMD_RCGR/CFG_RCGR. Nothing this driver has done ever programmed them,
++         * so every GMU write so far went into a block whose root clock was never
++         * started - and a branch whose parent is dead cannot acknowledge a halt,
++         * which is exactly why 0x1098 has been reading "running" all along. Set
++         * the root to 19.2 MHz off bi_tcxo (the first entry of the vendor's own
++         * gmu clock table) with the CM3 held in reset, then ask the block whether
++         * it has anything to say. */
++        printf("SWEET GPU: s10 clock root start\n");
++        printf("SWEET CC: S10 rcgr cmd=%#x cfg=%#x m=%#x n=%#x d=%#x\n",
++            sweet_gpu_rd(cc, SWEET_GPUCC_GMU_CMD_RCGR),
++            sweet_gpu_rd(cc, SWEET_GPUCC_GMU_CFG_RCGR),
++            sweet_gpu_rd(cc, SWEET_GPUCC_GMU_M_REG),
++            sweet_gpu_rd(cc, SWEET_GPUCC_GMU_N_REG),
++            sweet_gpu_rd(cc, SWEET_GPUCC_GMU_D_REG));
++
++        sweet_gpu_wr(gmu, SWEET_GMU_CM3_SYSRESET, 1u);
++        sweet_gpu_wr(cc, SWEET_GPUCC_GMU_CFG_RCGR, 0x1u);
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_GMU_CMD_RCGR);
++        sweet_gpu_wr(cc, SWEET_GPUCC_GMU_CMD_RCGR, v | 1u);
++        printf("SWEET CC: S10 update wait=%d us\n",
++            sweet_gpu_poll(cc, SWEET_GPUCC_GMU_CMD_RCGR, 1u, false, 2000));
++        printf("SWEET CC: S10 rcgr cmd=%#x cfg=%#x\n",
++            sweet_gpu_rd(cc, SWEET_GPUCC_GMU_CMD_RCGR),
++            sweet_gpu_rd(cc, SWEET_GPUCC_GMU_CFG_RCGR));
++        /* The GX half of the same GMU clock is its own branch; both need a live
++         * parent before the CM3 and the AO block can see anything. */
++        v = sweet_gpu_rd(cc, SWEET_GPUCC_GX_GMU_CBCR);
++        if (!(v & 1u)) {
++                sweet_gpu_wr(cc, SWEET_GPUCC_GX_GMU_CBCR, v | 1u);
++        }
++        printf("SWEET CC: S10 gx_gmu=%#x cx_gmu=%#x\n",
++            sweet_gpu_rd(cc, SWEET_GPUCC_GX_GMU_CBCR),
++            sweet_gpu_rd(cc, SWEET_GPUCC_CX_GMU_CBCR));
++
++        /* Eight samples, and the run stops here if nothing answers: with a live
++         * root and still no value, the next move is the rail vote, not a core
++         * left to execute an empty ITCM. */
++        uint32_t cfg_up = 0;
++        for (unsigned s = 0; s < 8; ++s) {
++                uint32_t cfg = sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG);
++                cfg_up |= cfg;
++                printf("SWEET GMU: S10 CM3_CFG[%u]=%#x\n", s, cfg);
++                delay(1000);
++        }
++        printf("SWEET GPU: s10 alive=%d\n", cfg_up != 0);
++        if (!cfg_up) {
++                printf("SWEET GPU: s10 clock root did not wake the block\n");
++                return;
++        }
++
++        /* The block answers, so the vendor's pre-boot configuration finally has
++         * something to land on: bus buffers, AO clock gating, then the reset the
++         * CM3 has been held in. No firmware is loaded, so the only outcome
++         * expected from the release is the invalid-firmware code. */
++        printf("SWEET GMU: S10 wake CM3_SYSRESET=%#x HFI_VERSION_INFO=%#x AO=%#x\n",
++            sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET),
++            sweet_gpu_rd(gmu, SWEET_GMU_HFI_VERSION_INFO),
++            sweet_gpu_rd(gmu, SWEET_GMU_AO_HOST_INTERRUPT_STATUS));
++        sweet_gpu_wr(gmu, SWEET_GMU_SYS_BUS_CONFIG, 1u);
++        sweet_gpu_wr(gmu, SWEET_GMU_CGC_MODE_CNTL, 0x20202u);
++        printf("SWEET GMU: S10 SYS_BUS_CONFIG=%#x CGC_MODE_CNTL=%#x\n",
++            sweet_gpu_rd(gmu, SWEET_GMU_SYS_BUS_CONFIG),
++            sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
++        sweet_gpu_wr(gmu, SWEET_GMU_PWR_COL_CP_RESP, 0u);
++        sweet_gpu_wr(gmu, SWEET_GMU_CM3_SYSRESET, 0u);
++        delay(2000);
++        printf("SWEET GMU: S10 CM3_SYSRESET=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET));
++        printf("SWEET GMU: S10 CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
++        printf("SWEET GMU: S10 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
++        printf("SWEET GPU: s10 done\n");
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
