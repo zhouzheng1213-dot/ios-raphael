@@ -502,6 +502,42 @@ static uint32_t to_us(uint64_t ticks)
         return ticks * 10 / 192;        /* 19.2 MHz */
 }
 
+/*
+ * GPU presence probe (Adreno a640).
+ *
+ * Vendor DT: qcom,kgsl-3d0@2C00000
+ *   kgsl_3d0_reg_memory  0x2c00000  (0x40000)  <- RBBM block, word 0 = VERSION
+ *   cx_dbgc              0x2c61000  (0x800)
+ *   qdss_gfx             0x6900000  (0x44000)
+ * RBBM_VERSION is the gate: a live a640 returns a 0x0MMmmppp style id, an
+ * unpowered or unclocked block reads back all zero. Read only.
+ */
+static void gpu_dump(void)
+{
+        const uintptr_t gpu = 0x2c00000UL;
+        const uintptr_t dbgc = 0x2c61000UL;
+        con_hex2("GPU", "v0=", rd32(gpu + 0x00u), "v1=", rd32(gpu + 0x04u));
+        con_hex2("   ", "v2=", rd32(gpu + 0x08u), "v3=", rd32(gpu + 0x0cu));
+        con_hex2("   ", "v4=", rd32(gpu + 0x10u), "v5=", rd32(gpu + 0x14u));
+        con_hex2("   ", "dbgc=", rd32(dbgc), "gpucc=", rd32(0x5090000UL));
+}
+
+/* Dependent multiply chain: ~1 iteration per 3-4 cycles on A55/A76. */
+static void cpu_bench(void)
+{
+        const uint32_t n = 1000000u;
+        uint32_t acc = 1;
+        uint64_t t0 = now();
+        for (uint32_t i = 0; i < n; i++) {
+                acc = acc * 1664525u + 1013904223u;
+        }
+        uint64_t t1 = now();
+        uint32_t us = to_us(t1 - t0);
+        /* iters per microsecond ~= core MHz / 4 */
+        con_hex2("BENCH", "us=", us, "acc=", acc);
+        con_hex2("BENCH", "iters/us=", us ? (n / us) : 0, "n=", n);
+}
+
 void shim_main(uint64_t dtb)
 {
         struct mmu_info mi;
@@ -520,6 +556,12 @@ void shim_main(uint64_t dtb)
         con_clear(RED);
         con_str("SHIM", "sweet milestone 4: xnu loader");
         con_skip();
+        /* Read-only EPSS snapshot; hold the screen so it can be photographed. */
+        gpu_dump();
+        cpu_bench();
+        con_skip();
+        delay_ms(6000);
+
         const char *why = loader_boot(dtb);
         con_str("LOADER", why);
         con_skip();
