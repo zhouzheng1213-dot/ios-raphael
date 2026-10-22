@@ -1,0 +1,43 @@
+0112: deterministic GMU readback + GPUCC clock-window sweep
+
+Two boots read the same GMU offsets and disagreed (CM3_CFG 0x4052 vs 0),
+so the readback itself is in question before any firmware work. Eight
+samples of CM3_CFG settle whether it is stable, and a dump of the GPUCC
+clock window locates gmu_clk_src: a branch can halt-ok while its root RCG
+is stopped, which is exactly how a live block reads all zero.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1437,6 +1437,31 @@ sweet_gpu_probe(void)
+         printf("SWEET GMU: R3 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
+         printf("SWEET GMU: R3 CM3_CFG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
+         printf("SWEET GPU: cm3 done\n");
++        if (level < 8) {
++                return;
++        }
++
++        /* Stage 8: prove the readback itself is deterministic before writing
++         * anything else. Eight samples of one static register: a stable value means
++         * the zeros seen on earlier boots were real state; a flickering one means
++         * the block has no clock and every read through it is meaningless. */
++        for (unsigned s = 0; s < 8; ++s) {
++                printf("SWEET GMU: cm3_cfg[%u]=%#x\n", s, sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
++                delay(1000);
++        }
++        /* A branch CBCR can report "running" while its root RCG is stopped, which
++         * is exactly how a live block ends up reading all zero. Dump the GPUCC
++         * clock window so gmu_clk_src can be identified from real values. */
++        printf("SWEET GPU: gpucc sweep\n");
++        for (uint32_t off = 0x1000u; off < 0x1140u; off += 0x20u) {
++                printf("SWEET CC: %04x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++                    off,
++                    sweet_gpu_rd(cc, off), sweet_gpu_rd(cc, off + 0x04u),
++                    sweet_gpu_rd(cc, off + 0x08u), sweet_gpu_rd(cc, off + 0x0cu),
++                    sweet_gpu_rd(cc, off + 0x10u), sweet_gpu_rd(cc, off + 0x14u),
++                    sweet_gpu_rd(cc, off + 0x18u), sweet_gpu_rd(cc, off + 0x1cu));
++        }
++        printf("SWEET GPU: stage8 done\n");
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
