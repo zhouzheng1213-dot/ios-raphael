@@ -1,0 +1,89 @@
+0108: read the a640 GMU registers that are actually live
+
+0107 read 1 KiB at 0x2c6a000 and saw only zeros, which looked like a dead
+block. Mesa 24.0 a6xx_gmu.xml places CM3_FW_INIT_RESULT at 0x14070, the HFI
+block at 0x14600 and the AO/host block at 0x24c14, so the zeros were just
+the POR-empty low window. Read those instead, one register per line so a
+hang names its own address.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1184,7 +1184,31 @@ out:
+  * register map for a640 has no public numeric header, so stage 5 dumps the
+  * first KiB instead of inventing offsets. */
+ #define SWEET_GPU_GMU_PA   0x02c6a000u
+-#define SWEET_GPU_GMU_SIZE 0x0400u
++/* The GMU window is 0x30000; the AO/host block alone sits at 0x24c14, so the
++ * 1 KiB window used by 0107 never reached a register that is live at POR. */
++#define SWEET_GPU_GMU_SIZE 0x25000u
++
++/* Offsets from Mesa src/freedreno/registers/adreno/a6xx_gmu.xml (mesa-24.0.0),
++ * converted from the dword index the XML stores to a byte offset. */
++#define SWEET_GMU_AO_HOST_INTERRUPT_STATUS 0x24c14u
++#define SWEET_GMU_AO_HOST_INTERRUPT_MASK   0x24c18u
++#define SWEET_GMU_AO_AHB_FENCE_CTRL        0x24c40u
++#define SWEET_GMU_AHB_FENCE_STATUS         0x24c4cu
++#define SWEET_GMU_CGC_MODE_CNTL            0x24c24u
++#define SWEET_GMU_HFI_CTRL_STATUS          0x14600u
++#define SWEET_GMU_HFI_VERSION_INFO         0x14604u
++#define SWEET_GMU_HFI_QTBL_ADDR            0x14614u
++#define SWEET_GMU_HFI_CTRL_INIT            0x14618u
++#define SWEET_GMU_GMU2HOST_INTR_INFO       0x14648u
++#define SWEET_GMU_HOST2GMU_INTR_EN_0       0x1465cu
++#define SWEET_GMU_CM3_FW_INIT_RESULT       0x14070u
++#define SWEET_GMU_CM3_FW_BUSY              0x14068u
++#define SWEET_GMU_CM3_CFG                  0x140b4u
++#define SWEET_GMU_CM3_SYSRESET             0x14000u
++#define SWEET_GMU_CM3_BOOT_CONFIG          0x14004u
++#define SWEET_GMU_BOOT_KMD_LM_HANDSHAKE    0x147c0u
++#define SWEET_GMU_ICACHE_CONFIG            0x13000u
++#define SWEET_GMU_RPMH_CTRL                0x143a0u
+ #define SWEET_GPUCC_CX_GMU_CBCR 0x1098u
+ #define SWEET_GPUCC_CXO_CBCR    0x109cu
+ 
+@@ -1317,21 +1341,34 @@ sweet_gpu_probe(void)
+             sweet_gpu_poll(cc, SWEET_GPUCC_CX_GMU_CBCR, SWEET_GPUCC_CLK_OFF, false, 2000),
+             sweet_gpu_rd(cc, SWEET_GPUCC_CX_GMU_CBCR));
+ 
+-        printf("SWEET GPU: dumping gmu\n");
++        printf("SWEET GPU: reading gmu state\n");
+         vm_offset_t gmu = ml_io_map(SWEET_GPU_GMU_PA, SWEET_GPU_GMU_SIZE);
+         if (!gmu) {
+                 printf("SWEET GPU: gmu map failed\n");
+                 return;
+         }
+-        for (uint32_t off = 0; off < SWEET_GPU_GMU_SIZE; off += 0x20u) {
+-                printf("SWEET GMU: %03x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-                    off,
+-                    sweet_gpu_rd(gmu, off), sweet_gpu_rd(gmu, off + 0x04u),
+-                    sweet_gpu_rd(gmu, off + 0x08u), sweet_gpu_rd(gmu, off + 0x0cu),
+-                    sweet_gpu_rd(gmu, off + 0x10u), sweet_gpu_rd(gmu, off + 0x14u),
+-                    sweet_gpu_rd(gmu, off + 0x18u), sweet_gpu_rd(gmu, off + 0x1cu));
+-        }
+-        printf("SWEET GPU: gmu dump done\n");
++        /* One register per line: if one read hangs the bus, the log ring keeps
++         * everything before it and names the address that killed the boot. */
++        printf("SWEET GMU: CM3_SYSRESET=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET));
++        printf("SWEET GMU: CM3_BOOT_CONFIG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_BOOT_CONFIG));
++        printf("SWEET GMU: CM3_CFG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
++        printf("SWEET GMU: CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
++        printf("SWEET GMU: CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
++        printf("SWEET GMU: ICACHE_CONFIG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_ICACHE_CONFIG));
++        printf("SWEET GMU: HFI_VERSION_INFO=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HFI_VERSION_INFO));
++        printf("SWEET GMU: HFI_CTRL_STATUS=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HFI_CTRL_STATUS));
++        printf("SWEET GMU: HFI_CTRL_INIT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HFI_CTRL_INIT));
++        printf("SWEET GMU: HFI_QTBL_ADDR=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HFI_QTBL_ADDR));
++        printf("SWEET GMU: GMU2HOST_INTR_INFO=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_GMU2HOST_INTR_INFO));
++        printf("SWEET GMU: HOST2GMU_INTR_EN_0=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_HOST2GMU_INTR_EN_0));
++        printf("SWEET GMU: BOOT_KMD_LM_HANDSHAKE=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_BOOT_KMD_LM_HANDSHAKE));
++        printf("SWEET GMU: RPMH_CTRL=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_RPMH_CTRL));
++        printf("SWEET GMU: AO_HOST_INTERRUPT_STATUS=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_AO_HOST_INTERRUPT_STATUS));
++        printf("SWEET GMU: AO_HOST_INTERRUPT_MASK=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_AO_HOST_INTERRUPT_MASK));
++        printf("SWEET GMU: AO_AHB_FENCE_CTRL=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_AO_AHB_FENCE_CTRL));
++        printf("SWEET GMU: AHB_FENCE_STATUS=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_AHB_FENCE_STATUS));
++        printf("SWEET GMU: CGC_MODE_CNTL=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
++        printf("SWEET GPU: gmu state done\n");
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
