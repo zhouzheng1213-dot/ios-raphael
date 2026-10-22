@@ -1,0 +1,104 @@
+0113: bus-buffer and AO-gating writes, each judged by CM3_CFG
+
+0112 settled the readback question: the zeros are real, so the block is
+either unpowered or being silenced by configuration. 0110 section 8
+names the two registers the vendor driver writes before it ever touches
+the CM3, and both are cheap to be wrong about. Each candidate writes one
+register, reads it back, then re-reads CM3_CFG: a value we never wrote is
+the only proof the read path is alive, because a register that echoes our
+own write proves no more than an interconnect ack. The read-only AO
+delay/hyst pair and sixteen samples of the AO interrupt status then
+separate "AO powered, CM3 dead" from "nothing powered", and eight closing
+samples keep a "still zero" verdict above the doubt that overturned 0108.
+
+Prediction if c1 or c2 works: CM3_CFG returns a plausible reset value
+(0x4052-shaped), not 0xffffffff, and the next boot runs 0110 section 3.
+All four silent: the answer is the rail vote, not more register poking.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1196,6 +1196,8 @@ out:
+ #define SWEET_GMU_AO_AHB_FENCE_CTRL        0x24c40u
+ #define SWEET_GMU_AHB_FENCE_STATUS         0x24c4cu
+ #define SWEET_GMU_CGC_MODE_CNTL            0x24c24u
++#define SWEET_GMU_CGC_DELAY_CNTL           0x24c28u
++#define SWEET_GMU_CGC_HYST_CNTL            0x24c2cu
+ #define SWEET_GMU_HFI_CTRL_STATUS          0x14600u
+ #define SWEET_GMU_HFI_VERSION_INFO         0x14604u
+ #define SWEET_GMU_HFI_QTBL_ADDR            0x14614u
+@@ -1209,6 +1211,7 @@ out:
+ #define SWEET_GMU_CM3_BOOT_CONFIG          0x14004u
+ #define SWEET_GMU_BOOT_KMD_LM_HANDSHAKE    0x147c0u
+ #define SWEET_GMU_ICACHE_CONFIG            0x13000u
++#define SWEET_GMU_SYS_BUS_CONFIG           0x1303cu
+ #define SWEET_GMU_RPMH_CTRL                0x143a0u
+ #define SWEET_GMU_CM3_DTCM_START           0x07000u
+ #define SWEET_GMU_PWR_COL_CP_RESP          0x14404u
+@@ -1462,6 +1465,66 @@ sweet_gpu_probe(void)
+                     sweet_gpu_rd(cc, off + 0x18u), sweet_gpu_rd(cc, off + 0x1cu));
+         }
+         printf("SWEET GPU: stage8 done\n");
++        if (level < 9) {
++                return;
++        }
++
++        /* Stage 9: 0112 showed the zeros are stable, so the block is either
++         * unpowered or being silenced by configuration. These are the two writes
++         * the vendor driver performs before it ever starts the CM3, ordered by
++         * how cheap they are to be wrong about. CM3_CFG is re-read after each
++         * one, because a value we did not write is the only evidence the read
++         * path is alive: a register that echoes our own write proves no more
++         * than "something acked the bus". */
++        printf("SWEET GPU: s9 bus/ao start\n");
++        printf("SWEET GMU: S9 pre CM3_CFG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
++
++        /* 1. a6xx_gmu_power_config() labels this "disable GMU WB/RB buffer". A GMU
++         * whose bus buffers were never configured can absorb accesses and answer
++         * zero to everything, which is exactly the symptom on the table. */
++        sweet_gpu_wr(gmu, SWEET_GMU_SYS_BUS_CONFIG, 1u);
++        printf("SWEET GMU: S9 c1 SYS_BUS_CONFIG rb=%#x\n",
++            sweet_gpu_rd(gmu, SWEET_GMU_SYS_BUS_CONFIG));
++        printf("SWEET GMU: S9 c1 CM3_CFG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
++
++        /* 2. a640's own gmu_cgc_mode. If the AO clock controller is parked in a
++         * state the CM3 cannot wake out of, this register records that state and
++         * writing the vendor value is the fix rather than a guess. */
++        sweet_gpu_wr(gmu, SWEET_GMU_CGC_MODE_CNTL, 0x20202u);
++        printf("SWEET GMU: S9 c2 CGC_MODE_CNTL rb=%#x\n",
++            sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
++        printf("SWEET GMU: S9 c2 CM3_CFG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
++
++        /* 3. Read-only. A plausible delay/hyst pair with CM3_CFG still zero means
++         * the AO half came up on its own and the CM3 half did not: a split rail,
++         * not a clock gate, and the next move is the rail vote rather than more
++         * register poking. */
++        printf("SWEET GMU: S9 c3 CGC_DELAY_CNTL=%#x\n",
++            sweet_gpu_rd(gmu, SWEET_GMU_CGC_DELAY_CNTL));
++        printf("SWEET GMU: S9 c3 CGC_HYST_CNTL=%#x\n",
++            sweet_gpu_rd(gmu, SWEET_GMU_CGC_HYST_CNTL));
++
++        /* 4. Sixteen samples, not one (0110 section 9): a live AO block may latch
++         * an interrupt from our own fence and power writes, and a single zero
++         * cannot separate "idle and powered" from "not powered at all". */
++        for (unsigned s = 0; s < 16; ++s) {
++                printf("SWEET GMU: S9 c4 ao_status[%u]=%#x\n", s,
++                    sweet_gpu_rd(gmu, SWEET_GMU_AO_HOST_INTERRUPT_STATUS));
++                delay(1000);
++        }
++        printf("SWEET GMU: S9 c4 ao_mask=%#x\n",
++            sweet_gpu_rd(gmu, SWEET_GMU_AO_HOST_INTERRUPT_MASK));
++
++        /* The verdict this boot exists to produce. Eight more samples so a "still
++         * zero" answer survives the same test that overturned 0108; anything
++         * non-zero here is the CM3 answering for the first time, and the next
++         * boot goes straight to the 0110 section 3 firmware sequence. */
++        for (unsigned s = 0; s < 8; ++s) {
++                printf("SWEET GMU: S9 tail CM3_CFG[%u]=%#x\n", s,
++                    sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
++                delay(1000);
++        }
++        printf("SWEET GPU: s9 done alive=%d\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG) != 0);
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
