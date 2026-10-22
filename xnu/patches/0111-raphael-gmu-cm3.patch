@@ -1,0 +1,54 @@
+0111: release the a640 GMU CM3 (stage 7, no firmware)
+
+0109 showed CM3_CFG=0x4052 with CM3_SYSRESET=1: the GMU is alive and
+held in reset. This stage drops SYSRESET, clears the power-collapse
+response register the way a6xx_gmu_start() does, and reads
+CM3_FW_INIT_RESULT against the ABI-selected expected value. Nothing is
+written to ITCM, so the only two outcomes are "invalid firmware" or
+"still silent", and neither can hang the bus.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1210,6 +1210,8 @@ out:
+ #define SWEET_GMU_BOOT_KMD_LM_HANDSHAKE    0x147c0u
+ #define SWEET_GMU_ICACHE_CONFIG            0x13000u
+ #define SWEET_GMU_RPMH_CTRL                0x143a0u
++#define SWEET_GMU_CM3_DTCM_START           0x07000u
++#define SWEET_GMU_PWR_COL_CP_RESP          0x14404u
+ #define SWEET_GPUCC_CX_GMU_CBCR 0x1098u
+ #define SWEET_GPUCC_CXO_CBCR    0x109cu
+ 
+@@ -1409,6 +1411,32 @@ sweet_gpu_probe(void)
+         printf("SWEET GMU: R2 AHB_FENCE_STATUS=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_AHB_FENCE_STATUS));
+         printf("SWEET GMU: R2 CGC_MODE_CNTL=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CGC_MODE_CNTL));
+         printf("SWEET GPU: gmu vote done\n");
++        if (level < 7) {
++                return;
++        }
++
++        /* Stage 7: release the CM3 and see whether the reset is really ours to
++         * control. No firmware is written here, so a CM3 that runs must report an
++         * invalid-firmware code; staying silent is the other useful answer. The
++         * expected value comes from a6xx_gmu_start(): it reads the last DTCM word
++         * to pick between the old and new firmware ABI. */
++        uint32_t dtcm_last = sweet_gpu_rd(gmu, SWEET_GMU_CM3_DTCM_START + 0xff8u);
++        uint32_t fw_mask = (dtcm_last <= 0x20010004u) ? 0xffffffffu : 0x1ffu;
++        uint32_t fw_expect = (dtcm_last <= 0x20010004u) ? 0xbabefaceu : 0x100u;
++        printf("SWEET GPU: dtcm_last=%#x mask=%#x expect=%#x\n",
++            dtcm_last, fw_mask, fw_expect);
++
++        sweet_gpu_wr(gmu, SWEET_GMU_CM3_SYSRESET, 1u);
++        delay(100);
++        sweet_gpu_wr(gmu, SWEET_GMU_PWR_COL_CP_RESP, 0u);
++        sweet_gpu_wr(gmu, SWEET_GMU_CM3_SYSRESET, 0u);
++        delay(2000);
++
++        printf("SWEET GMU: R3 CM3_SYSRESET=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_SYSRESET));
++        printf("SWEET GMU: R3 CM3_FW_INIT_RESULT=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_INIT_RESULT));
++        printf("SWEET GMU: R3 CM3_FW_BUSY=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_FW_BUSY));
++        printf("SWEET GMU: R3 CM3_CFG=%#x\n", sweet_gpu_rd(gmu, SWEET_GMU_CM3_CFG));
++        printf("SWEET GPU: cm3 done\n");
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_RAPHAEL */
